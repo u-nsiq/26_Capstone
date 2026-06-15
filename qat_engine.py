@@ -282,8 +282,9 @@ def set_trainable(model, layer_names):
     hit = 0
     for name, m in model.named_modules():
         if name in name_set:
-            for p in m.parameters(recurse=False):
-                p.requires_grad_(True); hit += 1
+            w = getattr(m, 'weight', None)   # weight-only: bias는 열지 않음(통제 유지, Codex)
+            if w is not None:
+                w.requires_grad_(True); hit += 1
     assert hit > 0, f"set_trainable: {layer_names} 중 매칭된 학습 파라미터 0개 — 이름 확인"
     _freeze_bn_stats(model)
     return model
@@ -305,6 +306,8 @@ def short_qat(model, train_loader, val_loader, steps=None, lr=1e-3, momentum=0.0
 
     model.train(); _freeze_bn_stats(model)
     eval_at = sorted(set(int(t) for t in eval_at))
+    if steps is not None and not plateau:
+        assert max(eval_at) <= steps, f"eval_at 최대({max(eval_at)}) > steps({steps}) — 뒷 시점이 조용히 빠짐 (Codex)"
     results, state = {}, None
     best, since_improve = -1.0, 0
 
