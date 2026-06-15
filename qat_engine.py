@@ -17,7 +17,7 @@ Budget-Dependent Quantization Recovery · CNN·W4 cell.
 [device] swap 후 새 모듈을 원본 device로 이동 (파일럿 device-order 버그 방지).
 [BNfrz]  set_trainable에서 BN running stats 고정(eval) — 통계 갱신이 숨은 학습 되지 않게.        (04 §5-7)
 
-S1에서 추가 예정(여기 없음): proxy_scores(5종 sweep) · select_subset · spearman · inversion_strength.
+S1 구현됨(§6): proxy_scores(5종) · select_subset · spearman · inversion_strength · fisher_diag · isolated_output_delta · make_ptq_model 등.
 """
 
 import os, json, random, copy
@@ -358,10 +358,12 @@ def hvp_layer(model, layer_name, delta, x, y, criterion=None, device=DEVICE):
     prev = W.requires_grad; W.requires_grad_(True)
     model.eval()                                  # 곡률은 결정적 forward에서(BN/dropout 고정)
     x, y, delta = x.to(device), y.to(device), delta.to(device)
-    loss = criterion(model(x), y)
-    g  = torch.autograd.grad(loss, W, create_graph=True)[0]      # ∂L/∂W
-    Hv = torch.autograd.grad((g * delta).sum(), W)[0]            # H·δ
-    W.requires_grad_(prev)
+    try:                                              # 에러나도 requires_grad 원복 (Codex)
+        loss = criterion(model(x), y)
+        g  = torch.autograd.grad(loss, W, create_graph=True)[0]      # ∂L/∂W
+        Hv = torch.autograd.grad((g * delta).sum(), W)[0]            # H·δ
+    finally:
+        W.requires_grad_(prev)
     return Hv.detach()
 
 
@@ -438,6 +440,7 @@ def fisher_diag(model, calib_loader, layers, n_batches=4, device=DEVICE):
     """층-합 Fisher = E[‖∇_{W_l}L‖²] (= grad_norm²와 동치). PTQ 모델 위, backward 1회/배치."""
     crit = nn.CrossEntropyLoss()
     mods = dict(model.named_modules())
+    prev = {n: mods[n].weight.requires_grad for n in layers}   # 복원용 (Codex #4)
     for n in layers:
         mods[n].weight.requires_grad_(True)
     model.eval()
@@ -453,6 +456,8 @@ def fisher_diag(model, calib_loader, layers, n_batches=4, device=DEVICE):
             if g is not None:
                 acc[n] += (g.detach() ** 2).sum().item()
         nb += 1
+    for n in layers:
+        mods[n].weight.requires_grad_(prev[n])   # requires_grad 원복 (Codex #4)
     return {n: acc[n] / max(nb, 1) for n in layers}
 
 
@@ -471,9 +476,11 @@ def isolated_output_delta(fp_model, n_bits, calib_loader, layers, n_batches=4, d
     out = {}
     for n in layers:
         w = mods[n].weight; orig = w.data.clone(); s = scales[n].to(w.device)
-        with torch.no_grad():
-            w.data = torch.clamp(torch.round(orig / s), -qmax, qmax) * s
-            out[n] = sum((fp_model(x) - fl).pow(2).sum().item() for x, fl in zip(xs, fp_logits))
+        try:                                          # 에러나도 fp_model 복원 보장 (Codex)
+            with torch.no_grad():
+                w.data = torch.clamp(torch.round(orig / s), -qmax, qmax) * s
+                out[n] = sum((fp_model(x) - fl).pow(2).sum().item() for x, fl in zip(xs, fp_logits))
+        finally:
             w.data = orig
     return out
 
@@ -494,8 +501,11 @@ def proxy_scores(ptq_model, fp_model, n_bits, calib_loader, layers=None, n_batch
 
 
 def spearman(a, b):
-    """Spearman 순위상관 ρ (scipy). a,b = 같은 순서의 값 리스트."""
+    """Spearman 순위상관 ρ (scipy). 상수 벡터면 정의 안 됨 → np.nan (0으로 위장 안 함, Codex #5)."""
     from scipy.stats import spearmanr
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    if np.ptp(a) == 0 or np.ptp(b) == 0:
+        return float('nan')
     rho, _ = spearmanr(a, b)
     return float(rho)
 
