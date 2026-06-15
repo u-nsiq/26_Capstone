@@ -1,0 +1,7 @@
+# torch / torchvision 은 Colab 기본 제공 — 여기서 핀하지 않음(런타임과 충돌 방지).
+# 재현 필요 시 사용한 torch 버전을 노트북 첫 셀에서 print 해 기록만.
+timm>=0.9.0
+numpy>=1.24
+# torchao 는 sprint에서 *선택* — W8 sanity의 fc(Linear) 한 층 보조 비교에만 사용.
+# Colab torch 버전과 싸우면 그냥 빼도 됨(W8 무손실 + round-trip 으로 충분).  (#2/#3)
+# torchao>=0.7.0
