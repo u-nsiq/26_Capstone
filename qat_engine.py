@@ -20,7 +20,7 @@ Budget-Dependent Quantization Recovery · CNN·W4 cell.
 S1에서 추가 예정(여기 없음): proxy_scores(5종 sweep) · select_subset · spearman · inversion_strength.
 """
 
-import os, json, random
+import os, json, random, copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -407,3 +407,110 @@ def load_runs(path='outputs/runs.jsonl'):
         return []
     with open(path, encoding='utf-8') as f:
         return [json.loads(l) for l in f if l.strip()]
+
+
+# =====================================================================
+# 6. S1 — proxy sweep + 순위분석 (역전·예측)
+# =====================================================================
+def list_quant_layers(model):
+    """양자화 층 이름 목록 (QConv2d/QLinear)."""
+    return [n for n, m in model.named_modules() if isinstance(m, (QConv2d, QLinear))]
+
+
+def get_layer_costs(model, layers=None):
+    """층별 학습 비용 ∝ 파라미터 수 (S2 예산 B용)."""
+    layers = layers or list_quant_layers(model)
+    mods = dict(model.named_modules())
+    return {n: mods[n].weight.numel() for n in layers}
+
+
+def clone_fp32_model(fp_model):
+    """FP 모델 깊은 복사 (디스크 재로드 대신 메모리서 fresh 모델, Codex)."""
+    return copy.deepcopy(fp_model)
+
+
+def make_ptq_model(fp_model, n_bits, device=DEVICE):
+    """FP 모델 → fresh PTQ 모델 (deepcopy 후 ptq). 다회 run 효율."""
+    return ptq(copy.deepcopy(fp_model), n_bits, device=device)
+
+
+def fisher_diag(model, calib_loader, layers, n_batches=4, device=DEVICE):
+    """층-합 Fisher = E[‖∇_{W_l}L‖²] (= grad_norm²와 동치). PTQ 모델 위, backward 1회/배치."""
+    crit = nn.CrossEntropyLoss()
+    mods = dict(model.named_modules())
+    for n in layers:
+        mods[n].weight.requires_grad_(True)
+    model.eval()
+    acc = {n: 0.0 for n in layers}; nb = 0
+    for i, (x, y) in enumerate(calib_loader):
+        if i >= n_batches:
+            break
+        x, y = x.to(device), y.to(device)
+        model.zero_grad()
+        crit(model(x), y).backward()
+        for n in layers:
+            g = mods[n].weight.grad
+            if g is not None:
+                acc[n] += (g.detach() ** 2).sum().item()
+        nb += 1
+    return {n: acc[n] / max(nb, 1) for n in layers}
+
+
+def isolated_output_delta(fp_model, n_bits, calib_loader, layers, n_batches=4, device=DEVICE):
+    """그 층 *하나만* 양자화했을 때 최종 logit 변화 ‖Δlogit‖² (forward-only, FP 위). RQ6 proxy."""
+    mods = dict(fp_model.named_modules())
+    scales = compute_scales(fp_model, n_bits)
+    qmax = 2 ** (n_bits - 1) - 1
+    fp_model.eval()
+    xs, fp_logits = [], []
+    with torch.no_grad():
+        for i, (x, y) in enumerate(calib_loader):
+            if i >= n_batches:
+                break
+            x = x.to(device); xs.append(x); fp_logits.append(fp_model(x).detach())
+    out = {}
+    for n in layers:
+        w = mods[n].weight; orig = w.data.clone(); s = scales[n].to(w.device)
+        with torch.no_grad():
+            w.data = torch.clamp(torch.round(orig / s), -qmax, qmax) * s
+            out[n] = sum((fp_model(x) - fl).pow(2).sum().item() for x, fl in zip(xs, fp_logits))
+            w.data = orig
+    return out
+
+
+def proxy_scores(ptq_model, fp_model, n_bits, calib_loader, layers=None, n_batches=4, device=DEVICE):
+    """층별 5종 proxy: δᵀHδ·‖Hδ‖²(+부호)·Fisher·weight-error·isolated-output. 전부 학습 0(PTQ 위)."""
+    layers = layers or list_quant_layers(ptq_model)
+    deltas = quant_error(ptq_model)
+    werr = {n: deltas[n].pow(2).sum().item() for n in layers}
+    fisher = fisher_diag(ptq_model, calib_loader, layers, n_batches, device)
+    iso = isolated_output_delta(fp_model, n_bits, calib_loader, layers, n_batches, device)
+    out = {}
+    for n in layers:
+        hv = hvp_proxies(ptq_model, n, deltas[n], calib_loader, n_batches, device)
+        out[n] = dict(dtHd=hv['dtHd'], normHd2=hv['normHd2'], sign=hv['sign'],
+                      fisher=fisher[n], werr=werr[n], iso_out=iso[n])
+    return out
+
+
+def spearman(a, b):
+    """Spearman 순위상관 ρ (scipy). a,b = 같은 순서의 값 리스트."""
+    from scipy.stats import spearmanr
+    rho, _ = spearmanr(a, b)
+    return float(rho)
+
+
+def inversion_strength(short_recov, plateau_recov):
+    """역전 강도 = 1 − Spearman(단기 회복 순위, 수렴 회복 순위). 같은 층 순서 리스트."""
+    return 1.0 - spearman(short_recov, plateau_recov)
+
+
+def select_subset(scores, costs, budget_ratio, by='normHd2'):
+    """proxy-top-k: by 점수 내림차순으로 예산(budget_ratio×총비용)까지 greedy (S2)."""
+    budget = budget_ratio * sum(costs.values())
+    key = lambda n: (scores[n][by] if isinstance(scores[n], dict) else scores[n])
+    chosen, c = [], 0.0
+    for n in sorted(scores, key=key, reverse=True):
+        if c + costs[n] <= budget:
+            chosen.append(n); c += costs[n]
+    return chosen
