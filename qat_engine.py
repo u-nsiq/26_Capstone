@@ -5,7 +5,7 @@ Budget-Dependent Quantization Recovery · CNN·W4 cell.
 
 이 파일에 박힌 "잠긴 결정 + 합의된 수정"
 --------------------------------------------------------------------
-[엔진]   manual additive-STE fake-quant, per-channel, scale은 calib로 한 번 정해 *고정*.   (04 §8, 06 §①, #4)
+[엔진]   manual additive-STE fake-quant, per-channel, scale은 가중치에서 한 번 정해 *고정*(weight-only, activation calib 아님).   (04 §8, 06 §①, #4)
 [mom=0]  진단/핵심 run은 vanilla SGD(momentum=0). §4.2 닫힌형태는 vanilla GD((1-ηλ)^t)이고,
          heavy-ball은 저곡률 방향을 가속해 방향별 수렴속도 격차(=단기 λ² 가중이 사는 곳)를 압축한다.
          → 0.9는 11월 "가속에도 살아남나" 축. (기존 lock SGD mom0.9 → 0으로 교정.)             (#3)
@@ -68,7 +68,7 @@ _CIFAR100_STD  = (0.2673, 0.2564, 0.2762)
 def get_loaders(dataset='cifar100', batch=128, calib_size=512,
                 data_root='./data', num_workers=2):
     """train(증강O) / val / calib(증강X, train에서 calib_size장) 로더.
-    calib = PTQ scale + (S1)HVP/Fisher 추정 공용 — 증강 없이 고정."""
+    calib = (S1)HVP/Fisher 추정용 — weight-only PTQ scale엔 calib 안 씀(가중치서 결정). 증강 없이 고정."""
     from torchvision import datasets, transforms
     from torch.utils.data import DataLoader, Subset
     assert dataset == 'cifar100', "S0는 cifar100 고정"
@@ -138,6 +138,7 @@ def fake_quant(w, scale, n_bits):
     """대칭 per-channel fake-quant + additive STE.  Q(w) = clamp(round(w/s), -qmax, qmax)*s
     반환값은 w + (wq - w).detach() → 값은 wq, gradient는 w로 직통(STE).
     scale은 *인자로 받는다*(매 forward 재계산 X) → 양자화 격자 고정 → δ·H가 학습 내내 well-defined. (#4)"""
+    assert n_bits >= 2, "manual 엔진은 W2+ 전용 (W1은 qmax=0 → GSB로 처리, #5 Codex)"
     qmax = 2 ** (n_bits - 1) - 1
     wq = torch.clamp(torch.round(w / scale), -qmax, qmax) * scale
     return w + (wq - w).detach()
@@ -146,6 +147,7 @@ def fake_quant(w, scale, n_bits):
 def compute_scales(model, n_bits, per_channel=True):
     """각 Conv2d/Linear 가중치에서 per-channel amax 기반 scale을 *한 번* 계산해 dict로.
     weight-only 대칭 양자화라 calib 데이터 불필요(가중치 자체에서 결정). 활성화 양자화는 11월."""
+    assert n_bits >= 2, "manual 엔진은 W2+ 전용 (W1은 qmax=0 → GSB로 처리, #5 Codex)"
     qmax = 2 ** (n_bits - 1) - 1
     scales = {}
     for name, m in model.named_modules():
