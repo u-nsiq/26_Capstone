@@ -510,6 +510,15 @@ def spearman(a, b):
     return float(rho)
 
 
+def kendall(a, b):
+    """Kendall τ (§7 — Spearman 보강). 상수 벡터면 np.nan."""
+    from scipy.stats import kendalltau
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    if np.ptp(a) == 0 or np.ptp(b) == 0:
+        return float('nan')
+    return float(kendalltau(a, b)[0])
+
+
 def inversion_strength(short_recov, plateau_recov):
     """역전 강도 = 1 − Spearman(단기 회복 순위, 수렴 회복 순위). 같은 층 순서 리스트."""
     return 1.0 - spearman(short_recov, plateau_recov)
