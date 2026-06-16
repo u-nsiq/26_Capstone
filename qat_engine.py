@@ -619,8 +619,11 @@ def partial_spearman(x, y, z):
 
 
 def hvp_finite_diff(model, layer_name, delta, x, y, eps=1e-2, criterion=None, device=DEVICE):
-    """유한차분 Hδ ≈ [∇L(W+εδ) − ∇L(W−εδ)]/(2ε). 실모델서 Pearlmutter hvp_layer 1회 교차검증.
-    반환 = Hδ 텐서. 노트북서 cos유사도·상대오차로 hvp_layer와 대조(toy는 이미 float64 rel 3.8e-7)."""
+    """유한차분 Hδ ≈ [∇L(W+εδ) − ∇L(W−εδ)]/(2ε). 반환 = Hδ 텐서.
+    ⚠ fake-quant(QConv2d) 모델에 쓰면 함정: forward가 ±εδ를 *재양자화*(round)해 FD가 dense H·δ가 아니라
+      sparse 재양자화 점프를 잰다 → hvp_layer와 cos≪1 거짓경보(claude.ai). 정식 실모델 교차검증은
+      plain(비양자화) 모델 weight=wq0 둘레에서 float64로 ±εδ. hvp_layer 자체는 toy(float64 rel 3.8e-7)
+      + S0(실모델 finite·non-zero·PSD부호)로 이미 검증됨 — 이 함수는 그 정식 FD(11월)용 보관."""
     criterion = criterion or nn.CrossEntropyLoss()
     W = dict(model.named_modules())[layer_name].weight
     x, y, delta = x.to(device), y.to(device), delta.to(device)
