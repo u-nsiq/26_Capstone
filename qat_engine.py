@@ -574,8 +574,9 @@ def lambda_max_layer(model, layer_name, calib_loader, n_iter=15, n_batches=4, de
 
 
 def perm_pvalue_related(short_recov, plateau_recov, n_perm=2000, seed=0):
-    """순열검정: 귀무(층 라벨 무작위)에서 단기·수렴 순위가 *우연히* 이만큼 양의 상관일 확률.
-    p 작음 = 두 순위가 진짜 관련(=neither noise nor breakdown). 21층 셔플이라 seed 적어도 잘 작동."""
+    """순열검정(보조 지표): 귀무(층 라벨 무작위)에서 단기·수렴 순위가 *우연히* 이만큼 양의 상관일 확률.
+    p 작음 = 단기·수렴 순위가 양의 관련(=랜덤 아님)일 뿐 — *역전 유의성은 아님*. real_inversion 판정엔 안 씀
+    (그건 rank_stability + bootstrap CI + breakdown gate가 함). short-long rank relation 보조용. 21층 셔플."""
     rng = np.random.default_rng(seed)
     a = np.asarray(short_recov, float); b = np.asarray(plateau_recov, float)
     obs = spearman(a, b)
@@ -591,7 +592,8 @@ def perm_pvalue_related(short_recov, plateau_recov, n_perm=2000, seed=0):
 
 def bootstrap_inversion(short_per_seed, plateau_per_seed, n_boot=2000, seed=0):
     """seed 부트스트랩으로 inversion_strength 점추정+95%CI (자의적 SNR 컷 대신).
-    입력 = [seed][layer] 2D 리스트. seed 적으면 CI 넓음(=보조 지표, 주 판정은 perm_pvalue_related)."""
+    입력 = [seed][layer] 2D 리스트. real_inversion 판정 = rank_stability + 이 부트 CI(ci_lo>noise_inv)
+    + breakdown gate (perm_pvalue_related은 보조). seed 적으면 CI 넓음 → 5+ 권장."""
     rng = np.random.default_rng(seed)
     S = np.asarray(short_per_seed, float); P = np.asarray(plateau_per_seed, float)
     n_seed = S.shape[0]
