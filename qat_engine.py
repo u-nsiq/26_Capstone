@@ -608,6 +608,34 @@ def bootstrap_inversion(short_per_seed, plateau_per_seed, n_boot=2000, seed=0):
                 ci_hi=float(np.percentile(boots, 97.5)), n_boot=len(boots))
 
 
+def partial_spearman(x, y, z):
+    """z(층 크기 N 등)를 통제한 x–y 부분 순위상관 = (r_xy − r_xz·r_yz)/sqrt((1−r_xz²)(1−r_yz²)).
+    proxy↔회복 상관이 *곡률* 때문인지 *큰 층(N)* 때문인지 가른다(size 교란 제거, claude.ai②)."""
+    rxy = spearman(x, y); rxz = spearman(x, z); ryz = spearman(y, z)
+    if any(np.isnan(v) for v in (rxy, rxz, ryz)):
+        return float('nan')
+    denom = float(np.sqrt(max((1 - rxz**2) * (1 - ryz**2), 0.0)))
+    return float((rxy - rxz * ryz) / denom) if denom > 1e-12 else float('nan')
+
+
+def hvp_finite_diff(model, layer_name, delta, x, y, eps=1e-2, criterion=None, device=DEVICE):
+    """유한차분 Hδ ≈ [∇L(W+εδ) − ∇L(W−εδ)]/(2ε). 실모델서 Pearlmutter hvp_layer 1회 교차검증.
+    반환 = Hδ 텐서. 노트북서 cos유사도·상대오차로 hvp_layer와 대조(toy는 이미 float64 rel 3.8e-7)."""
+    criterion = criterion or nn.CrossEntropyLoss()
+    W = dict(model.named_modules())[layer_name].weight
+    x, y, delta = x.to(device), y.to(device), delta.to(device)
+    model.eval()
+    def grad_at(sgn):
+        orig = W.data.clone(); prev = W.requires_grad
+        W.data = orig + sgn * eps * delta; W.requires_grad_(True)
+        try:
+            g = torch.autograd.grad(criterion(model(x), y), W)[0].detach().clone()
+        finally:
+            W.data = orig; W.requires_grad_(prev)
+        return g
+    return ((grad_at(1.0) - grad_at(-1.0)) / (2 * eps)).detach()
+
+
 def select_subset(scores, costs, budget_ratio, by='normHd2'):
     """proxy-top-k: by 점수 내림차순으로 예산(budget_ratio×총비용)까지 greedy (S2)."""
     budget = budget_ratio * sum(costs.values())
