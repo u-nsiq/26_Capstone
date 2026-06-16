@@ -131,6 +131,19 @@ def evaluate(model, loader, device=DEVICE):
     return 100.0 * correct / total
 
 
+@torch.no_grad()
+def evaluate_full(model, loader, device=DEVICE, criterion=None):
+    """Top-1(%) + 평균 val loss를 한 번에 (loss-R 측정용 — proxy=loss곡률과 같은 공간서 회복 비교, S1.2)."""
+    criterion = criterion or nn.CrossEntropyLoss()
+    model.eval(); correct = total = 0; loss_sum = 0.0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        out = model(x)
+        loss_sum += criterion(out, y).item() * y.size(0)
+        correct += (out.argmax(1) == y).sum().item(); total += y.size(0)
+    return 100.0 * correct / total, loss_sum / total
+
+
 # =====================================================================
 # 2. 양자화 — manual additive-STE, per-channel, *고정* scale
 # =====================================================================
@@ -295,11 +308,14 @@ def set_trainable(model, layer_names):
 def short_qat(model, train_loader, val_loader, steps=None, lr=1e-3, momentum=0.0,
               seed=0, eval_at=(30, 100, 300), plateau=False,
               plateau_every=100, plateau_patience=5, plateau_eps=0.1,
-              max_plateau_steps=5000, device=DEVICE, return_state=False):
-    """짧은 QAT 회복 루프. 한 *궤적*을 돌며 eval_at 체크포인트에서 top1 기록
-    → {t: top1} 반환(여러 run이 아니라 한 run의 체크포인트, 04 §2.6/§5-2).
-    momentum=0 기본(#3). plateau=True면 더 안 오를 때까지 돌고 'plateau' 키 추가(수렴 대용).
-    return_state=True면 plateau 가중치(=단일층 실험의 경험적 φ*) state_dict도 반환 → δ_true vs δ_approx 공짜검증(#6)."""
+              max_plateau_steps=5000, device=DEVICE, return_state=False,
+              track_loss=False):
+    """짧은 QAT 회복 루프. 한 *궤적*을 돌며 eval_at 체크포인트에서 top1(+옵션 loss) 기록
+    → {t: top1} 반환 (track_loss=True면 {t: {'acc','loss'}}). 한 run의 체크포인트(04 §2.6/§5-2).
+    momentum=0 기본(#3). plateau=True=적응형 조기종료(층마다 다른 예산·느린 마라톤층 절단 위험, eps 클수록 심함);
+    S1.2는 plateau=False + steps=고정예산 + eval_at=고정 grid 권장(공정 비교·마라톤층 절단 제거).
+    track_loss=True → loss-R도 기록(proxy=loss곡률과 같은 공간서 회복 검증 = apples-to-apples).
+    return_state=True면 가중치 state_dict 반환(=단일층 실험의 경험적 φ*) → δ_true vs δ_approx 공짜검증(#6)."""
     set_seed(seed)
     params = [p for p in model.parameters() if p.requires_grad]
     assert params, "학습 파라미터 0 — set_trainable 먼저"
@@ -315,7 +331,11 @@ def short_qat(model, train_loader, val_loader, steps=None, lr=1e-3, momentum=0.0
 
     def _do_eval(tag):
         nonlocal results
-        results[tag] = evaluate(model, val_loader, device)
+        if track_loss:
+            a, l = evaluate_full(model, val_loader, device)
+            results[tag] = {'acc': a, 'loss': l}
+        else:
+            results[tag] = evaluate(model, val_loader, device)
         model.train(); _freeze_bn_stats(model)
 
     hard_cap = steps or (max_plateau_steps if plateau else max(eval_at))
@@ -338,9 +358,9 @@ def short_qat(model, train_loader, val_loader, steps=None, lr=1e-3, momentum=0.0
             else:
                 since_improve += 1
                 if since_improve >= plateau_patience:
-                    results['plateau'] = cur; break
+                    _do_eval('plateau'); break
     if plateau and 'plateau' not in results:
-        results['plateau'] = evaluate(model, val_loader, device)
+        _do_eval('plateau')
     if return_state:
         state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         return results, state
@@ -522,6 +542,70 @@ def kendall(a, b):
 def inversion_strength(short_recov, plateau_recov):
     """역전 강도 = 1 − Spearman(단기 회복 순위, 수렴 회복 순위). 같은 층 순서 리스트."""
     return 1.0 - spearman(short_recov, plateau_recov)
+
+
+# --- S1.2 정밀판: 곡률 스케일 점검 + 유의성(순열·부트스트랩) ---
+def _mean_hvp(model, layer_name, v, calib_loader, n_batches=4, device=DEVICE):
+    """calib 여러 배치 평균 H_l·v (power iteration용)."""
+    crit = nn.CrossEntropyLoss()
+    s, n = None, 0
+    for i, (x, y) in enumerate(calib_loader):
+        if i >= n_batches:
+            break
+        Hv = hvp_layer(model, layer_name, v, x, y, crit, device)
+        s = Hv if s is None else s + Hv; n += 1
+    return s / max(n, 1)
+
+
+def lambda_max_layer(model, layer_name, calib_loader, n_iter=15, n_batches=4, device=DEVICE):
+    """층 Hessian 최대-크기 고유값 추정(power iteration via HVP).
+    η·|λ_max|<1 이어야 §4.2 닫힌형태 (1-ηλ)^t 가 단조(발산/진동 아님) → lr 타당성 1회 점검."""
+    W = dict(model.named_modules())[layer_name].weight
+    v = torch.randn_like(W); v = v / (v.norm() + 1e-12)
+    lam = 0.0
+    for _ in range(n_iter):
+        Hv = _mean_hvp(model, layer_name, v, calib_loader, n_batches, device)
+        lam = float((v * Hv).sum().item())          # Rayleigh quotient (v 단위벡터)
+        nv = float(Hv.norm().item())
+        if nv < 1e-20:
+            break
+        v = Hv / nv
+    return lam
+
+
+def perm_pvalue_related(short_recov, plateau_recov, n_perm=2000, seed=0):
+    """순열검정: 귀무(층 라벨 무작위)에서 단기·수렴 순위가 *우연히* 이만큼 양의 상관일 확률.
+    p 작음 = 두 순위가 진짜 관련(=neither noise nor breakdown). 21층 셔플이라 seed 적어도 잘 작동."""
+    rng = np.random.default_rng(seed)
+    a = np.asarray(short_recov, float); b = np.asarray(plateau_recov, float)
+    obs = spearman(a, b)
+    if np.isnan(obs):
+        return dict(rho=float('nan'), p_value=float('nan'))
+    cnt = 0
+    for _ in range(n_perm):
+        r = spearman(a, rng.permutation(b))
+        if not np.isnan(r) and r >= obs:
+            cnt += 1
+    return dict(rho=float(obs), p_value=float((cnt + 1) / (n_perm + 1)))
+
+
+def bootstrap_inversion(short_per_seed, plateau_per_seed, n_boot=2000, seed=0):
+    """seed 부트스트랩으로 inversion_strength 점추정+95%CI (자의적 SNR 컷 대신).
+    입력 = [seed][layer] 2D 리스트. seed 적으면 CI 넓음(=보조 지표, 주 판정은 perm_pvalue_related)."""
+    rng = np.random.default_rng(seed)
+    S = np.asarray(short_per_seed, float); P = np.asarray(plateau_per_seed, float)
+    n_seed = S.shape[0]
+    point = inversion_strength(S.mean(0).tolist(), P.mean(0).tolist())
+    boots = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n_seed, n_seed)
+        iv = inversion_strength(S[idx].mean(0).tolist(), P[idx].mean(0).tolist())
+        if not np.isnan(iv):
+            boots.append(iv)
+    if not boots:
+        return dict(inversion=float(point), ci_lo=float('nan'), ci_hi=float('nan'), n_boot=0)
+    return dict(inversion=float(point), ci_lo=float(np.percentile(boots, 2.5)),
+                ci_hi=float(np.percentile(boots, 97.5)), n_boot=len(boots))
 
 
 def select_subset(scores, costs, budget_ratio, by='normHd2'):
