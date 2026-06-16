@@ -457,7 +457,9 @@ def make_ptq_model(fp_model, n_bits, device=DEVICE):
 
 
 def fisher_diag(model, calib_loader, layers, n_batches=4, device=DEVICE):
-    """층-합 Fisher = E[‖∇_{W_l}L‖²] (= grad_norm²와 동치). PTQ 모델 위, backward 1회/배치."""
+    """층별 proxy = 배치평균 그래디언트의 제곱노름 (1/nb)·Σ_b ‖∇_{W_l}(mean-CE)‖² (= mean-CE grad-norm²).
+    ⚠ true Fisher E_x‖∇log p_θ‖²도, 정식 empirical-Fisher 대각합 (1/B)Σ_j‖∇ℓ_j‖²도 아님 — true-label 사용 +
+    제곱 전 배치평균이라 batch-size 의존(batch=128 고정이라 층간 상대랭킹엔 무해). proxy 비교용. PTQ 위, backward 1회/배치."""
     crit = nn.CrossEntropyLoss()
     mods = dict(model.named_modules())
     prev = {n: mods[n].weight.requires_grad for n in layers}   # 복원용 (Codex #4)
@@ -588,6 +590,24 @@ def perm_pvalue_related(short_recov, plateau_recov, n_perm=2000, seed=0):
         if not np.isnan(r) and r >= obs:
             cnt += 1
     return dict(rho=float(obs), p_value=float((cnt + 1) / (n_perm + 1)))
+
+
+def noise_floor_matched(per_seed, n_split=400, seed=0):
+    """seed-*평균* 순위의 재현성 기반 noise floor = 1 − E[spearman(half_a_mean, half_b_mean)].
+    split-half(무작위로 seed를 둘로 갈라 각 절반 평균순위 간 상관). inversion은 seed-평균 벡터로 계산되므로
+    단일seed pairwise rank_stability(노이즈 full → noise 과대평가 → 게이트 과보수)보다 *같은 averaging level*에 정렬됨.
+    (감사 지적: ci_lo[seed-평균]과 noise_inv[단일seed]의 평균화 불일치 교정.) n<2면 nan."""
+    rng = np.random.default_rng(seed)
+    S = np.asarray(per_seed, float); n = S.shape[0]
+    if n < 2:
+        return float('nan')
+    h = n // 2; rs = []
+    for _ in range(n_split):
+        idx = rng.permutation(n)
+        r = spearman(S[idx[:h]].mean(0).tolist(), S[idx[h:]].mean(0).tolist())
+        if not np.isnan(r):
+            rs.append(r)
+    return (1.0 - float(np.mean(rs))) if rs else float('nan')
 
 
 def bootstrap_inversion(short_per_seed, plateau_per_seed, n_boot=2000, seed=0):
