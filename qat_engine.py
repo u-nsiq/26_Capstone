@@ -670,3 +670,129 @@ def select_subset(scores, costs, budget_ratio, by='normHd2'):
         if c + costs[n] <= budget:
             chosen.append(n); c += costs[n]
     return chosen
+
+
+# =====================================================================
+# 7. S1.5 — 메커니즘(PSD model-Fisher · anchor · 회복방향 · path) + subset(가산성·S2)
+#    매핑: 실험계획서 §3.2(PSD)·§3.3(path)·§3.4(anchor)·§2.6(가산성) · sprint S1.5a~d
+#    [용어 잠금] 여기 'Fisher'=PSD model-Fisher(=GGN, dtGd/normGd2) ≠ S1의 grad-response `fisher`(batch-grad²).
+# =====================================================================
+def ggn_layer(model, layer_name, delta, x, y, device=DEVICE):
+    """층 l의 GGN(=model-Fisher; CE+softmax서 정확히 일치)·벡터곱 G_l·δ_l 한 번.
+      G = (1/B)·Jᵀ H_L J ,  H_L = softmax 공분산 diag(p)−ppᵀ (⪰0)  →  δᵀGδ ⪰ 0 *항상 PSD*.
+    δᵀHδ가 저비트서 비-PSD로 깨지는 문제(hvp_proxies sign<0)의 PSD 대체 (S1.5a, A/B 분기).
+    이중 backward로 JVP(Jδ) → H_L 곱(해석적) → VJP(JᵀH_L·Jδ). GGN은 STE 2차항을 *건드리지 않아*
+    full-Hessian보다 안정(STE 병리 회피). HVP와 같은 ~2 backward 비용. δ=δ_l (shape=W_l)."""
+    W = dict(model.named_modules())[layer_name].weight
+    prev = W.requires_grad; W.requires_grad_(True)
+    model.eval()                                   # 곡률은 결정적 forward(BN/dropout 고정)
+    x, y, delta = x.to(device), y.to(device), delta.to(device)
+    B = x.size(0)
+    try:                                           # 에러나도 requires_grad 원복
+        z = model(x)                                                   # [B,C] logits
+        u = torch.zeros_like(z, requires_grad=True)
+        vjp = torch.autograd.grad(z, W, grad_outputs=u, create_graph=True)[0]      # Jᵀu (u의 함수)
+        Jd  = torch.autograd.grad(vjp, u, grad_outputs=delta, retain_graph=True)[0].detach()  # [B,C]=Jδ
+        p   = torch.softmax(z, dim=1).detach()                        # [B,C]
+        HJd = (p * Jd - p * (p * Jd).sum(1, keepdim=True)) / B        # (1/B)·H_L·Jδ
+        Gd  = torch.autograd.grad(z, W, grad_outputs=HJd)[0]          # Jᵀ(H_L Jδ)/B = Gδ
+    finally:
+        W.requires_grad_(prev)
+    return Gd.detach()
+
+
+def ggn_proxies(model, layer_name, delta, calib_loader, n_batches=4, device=DEVICE):
+    """calib 여러 배치 평균 G_l·δ_l → PSD proxy 두 개.
+      dtGd = δᵀGδ (⪰0, 수렴 proxy의 PSD판) , normGd2 = ‖Gδ‖² (단기 proxy의 PSD판).
+    hvp_proxies와 *같은 형태* → dtHd↔dtGd, normHd2↔normGd2 직접 비교(A/B). sign<0이면 수치 이상(원래 ⪰0)."""
+    Gd_sum, n = None, 0
+    for i, (x, y) in enumerate(calib_loader):
+        if i >= n_batches:
+            break
+        Gd = ggn_layer(model, layer_name, delta, x, y, device)
+        Gd_sum = Gd if Gd_sum is None else Gd_sum + Gd
+        n += 1
+    Gd = Gd_sum / max(n, 1)
+    dtGd = (delta.to(Gd.device) * Gd).sum().item()
+    return dict(dtGd=dtGd, normGd2=(Gd * Gd).sum().item(),
+                sign=int(np.sign(dtGd)), n_batches=n)
+
+
+def anchor_proxies(model, deltas, calib_loader, layers, n_batches=4, device=DEVICE):
+    """주어진 *기준점 모델*(FP / PTQ / warmup)에서 층별 곡률 proxy 4종 → {layer:{dtHd,normHd2,dtGd,normGd2}}.
+    3-anchor 비교(S1.5b)·A/B(S1.5a) 공용. deltas = quant_error(ptq_model) (모든 anchor서 *같은 δ* — 변위 기준 고정).
+    ⚠ FP-anchor엔 plain Conv2d/Linear(같은 이름)도 OK(hvp_layer는 .weight만 봄)."""
+    out = {}
+    for n in layers:
+        d = deltas[n]
+        hv = hvp_proxies(model, n, d, calib_loader, n_batches, device)
+        gg = ggn_proxies(model, n, d, calib_loader, n_batches, device)
+        out[n] = dict(dtHd=hv['dtHd'], normHd2=hv['normHd2'],
+                      dtGd=gg['dtGd'], normGd2=gg['normGd2'])
+    return out
+
+
+def path_integrated_grad(fp_model, n_bits, layer_name, train_loader,
+                         T=30, lr=1e-3, seed=0, device=DEVICE):
+    """layer_name만 학습하며 첫 T step의 Σ_{t<T}‖g_l(t)‖² 누적 (동적 proxy, *학습 0 아님*, S1.5c).
+    정적 1-shot proxy(‖Hδ‖² 등)가 못 잡는 budget 의존을 잡나 — 곡률응답 family와 중복 점검용."""
+    set_seed(seed)
+    qm = make_ptq_model(fp_model, n_bits, device)
+    set_trainable(qm, [layer_name])
+    W = dict(qm.named_modules())[layer_name].weight
+    opt = torch.optim.SGD([W], lr=lr, momentum=0.0)
+    crit = nn.CrossEntropyLoss()
+    qm.train(); _freeze_bn_stats(qm)
+    g2, it = 0.0, iter(train_loader)
+    for _ in range(T):
+        try:
+            x, y = next(it)
+        except StopIteration:
+            it = iter(train_loader); x, y = next(it)
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad(); crit(qm(x), y).backward()
+        g2 += (W.grad.detach() ** 2).sum().item()
+        opt.step()
+    return g2
+
+
+def recovery_direction(W_fp, W_qat, scale, n_bits):
+    """단일 층: QAT 가중치 이동이 양자화오차 δ 방향(de-quant)인가 직교(compensation)인가 (S1.5b 직접검증).
+      δ     = W_fp − Q(W_fp)        (de-quant 방향)
+      Δ_lat = W_qat − W_fp          (잠재 가중치 이동)
+      Δ_eff = Q(W_qat) − Q(W_fp)    (배포 가중치 이동)
+    cos(Δ,δ)≈+1 → de-quant 복원 / ≈0 → 보상적(다른 방향). STE라 latent·effective 둘 다 본다(해석 주의).
+    ⚠ fixed-scale라 effective가 grid에 묶임 → "FP32로 정확히 회귀?"는 완벽판정 불가 → *보조* 진단으로만.
+    W_qat = short_qat(...,return_state=True) state_dict의 '{layer}.weight'. 텐서 인자(층 1개)."""
+    dev = W_fp.device                                  # state_dict는 CPU 텐서 → device 정합(Colab GPU 크래시 방지)
+    W_qat = W_qat.to(dev); scale = scale.to(dev)
+    qmax = 2 ** (n_bits - 1) - 1
+    def Q(w):
+        return torch.clamp(torch.round(w / scale), -qmax, qmax) * scale
+    delta = (W_fp - Q(W_fp)).flatten()
+    d_lat = (W_qat - W_fp).flatten()
+    d_eff = (Q(W_qat) - Q(W_fp)).flatten()
+    def cos(a, b):
+        na, nb = a.norm(), b.norm()
+        return float((a @ b) / (na * nb)) if na > 1e-12 and nb > 1e-12 else float('nan')
+    nd, ne = delta.norm(), d_eff.norm()
+    if nd > 1e-12 and ne > 1e-12:
+        proj_ratio = float(((d_eff @ delta) / nd).abs() / ne)
+        orth_ratio = float((d_eff - (d_eff @ delta / nd ** 2) * delta).norm() / ne)
+    else:
+        proj_ratio = orth_ratio = float('nan')
+    return dict(cos_latent=cos(d_lat, delta), cos_eff=cos(d_eff, delta),
+                proj_ratio=proj_ratio, orth_ratio=orth_ratio)
+
+
+def recover_subset(fp_model, n_bits, layers_to_train, train_loader, val_loader,
+                   steps, eval_at=None, lr=1e-3, seed=0, device=DEVICE, return_state=False):
+    """fresh PTQ 모델 → layers_to_train만 학습 → {t:{acc,loss}} 궤적. 가산성(S1.5d)·subset(S2) 공용.
+    recovery는 호출측서 PTQ 기준 대비 계산(loss_R(t)=loss_PTQ−loss_t). momentum 0(닫힌형태 정합).
+    return_state=True → (results, state_dict): recovery_direction(cos Δ,δ)용 가중치 추출."""
+    qm = make_ptq_model(fp_model, n_bits, device)
+    set_trainable(qm, layers_to_train)
+    eval_at = eval_at or (steps,)
+    return short_qat(qm, train_loader, val_loader, steps=steps, eval_at=eval_at,
+                     lr=lr, momentum=0.0, seed=seed, track_loss=True,
+                     return_state=return_state, device=device)
