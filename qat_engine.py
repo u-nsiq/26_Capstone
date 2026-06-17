@@ -682,7 +682,9 @@ def ggn_layer(model, layer_name, delta, x, y, device=DEVICE):
       G = (1/B)·Jᵀ H_L J ,  H_L = softmax 공분산 diag(p)−ppᵀ (⪰0)  →  δᵀGδ ⪰ 0 *항상 PSD*.
     δᵀHδ가 저비트서 비-PSD로 깨지는 문제(hvp_proxies sign<0)의 PSD 대체 (S1.5a, A/B 분기).
     이중 backward로 JVP(Jδ) → H_L 곱(해석적) → VJP(JᵀH_L·Jδ). GGN은 STE 2차항을 *건드리지 않아*
-    full-Hessian보다 안정(STE 병리 회피). HVP와 같은 ~2 backward 비용. δ=δ_l (shape=W_l)."""
+    full-Hessian보다 안정(STE 병리 회피). HVP와 같은 ~2 backward 비용. δ=δ_l (shape=W_l).
+    반환 (Gδ 벡터, dtGd_quad). **dtGd_quad = Σ_i Var_{p_i}(Jδ_i)/B = 직접 분산형 → 구조적 ⪰0**(W2 breakdown서도).
+    δ·Gd(vjp 경로)는 수학적으로 같지만 collapsed regime서 backward 수치오차로 음수 날 수 있음 → 분산형이 정직. (Codex)"""
     W = dict(model.named_modules())[layer_name].weight
     prev = W.requires_grad; W.requires_grad_(True)
     model.eval()                                   # 곡률은 결정적 forward(BN/dropout 고정)
@@ -694,28 +696,55 @@ def ggn_layer(model, layer_name, delta, x, y, device=DEVICE):
         vjp = torch.autograd.grad(z, W, grad_outputs=u, create_graph=True)[0]      # Jᵀu (u의 함수)
         Jd  = torch.autograd.grad(vjp, u, grad_outputs=delta, retain_graph=True)[0].detach()  # [B,C]=Jδ
         p   = torch.softmax(z, dim=1).detach()                        # [B,C]
+        quad = (((p * Jd ** 2).sum(1) - (p * Jd).sum(1) ** 2).sum() / B).item()   # Σ Var_p(Jδ)/B ⪰0 (직접)
         HJd = (p * Jd - p * (p * Jd).sum(1, keepdim=True)) / B        # (1/B)·H_L·Jδ
-        Gd  = torch.autograd.grad(z, W, grad_outputs=HJd)[0]          # Jᵀ(H_L Jδ)/B = Gδ
+        Gd  = torch.autograd.grad(z, W, grad_outputs=HJd)[0]          # Jᵀ(H_L Jδ)/B = Gδ (vjp 경로)
     finally:
         W.requires_grad_(prev)
-    return Gd.detach()
+    return Gd.detach(), float(quad)
 
 
 def ggn_proxies(model, layer_name, delta, calib_loader, n_batches=4, device=DEVICE):
-    """calib 여러 배치 평균 G_l·δ_l → PSD proxy 두 개.
-      dtGd = δᵀGδ (⪰0, 수렴 proxy의 PSD판) , normGd2 = ‖Gδ‖² (단기 proxy의 PSD판).
-    hvp_proxies와 *같은 형태* → dtHd↔dtGd, normHd2↔normGd2 직접 비교(A/B). sign<0이면 수치 이상(원래 ⪰0)."""
-    Gd_sum, n = None, 0
+    """calib 여러 배치 평균 → PSD proxy.
+      dtGd = δᵀGδ를 *직접 분산형*(dtGd_quad, 구조적 ⪰0)으로 , normGd2 = ‖Gδ‖²(⪰0) ,
+      dtGd_vjp = δ·(평균 Gd) = 일치성 점검(W2 collapsed서 수치음수 가능 — 그래서 dtGd는 분산형이 주).
+    hvp_proxies와 같은 형태 → dtHd↔dtGd 직접 비교(A/B)."""
+    Gd_sum, quad_sum, n = None, 0.0, 0
     for i, (x, y) in enumerate(calib_loader):
         if i >= n_batches:
             break
-        Gd = ggn_layer(model, layer_name, delta, x, y, device)
+        Gd, quad = ggn_layer(model, layer_name, delta, x, y, device)
         Gd_sum = Gd if Gd_sum is None else Gd_sum + Gd
-        n += 1
+        quad_sum += quad; n += 1
     Gd = Gd_sum / max(n, 1)
-    dtGd = (delta.to(Gd.device) * Gd).sum().item()
-    return dict(dtGd=dtGd, normGd2=(Gd * Gd).sum().item(),
-                sign=int(np.sign(dtGd)), n_batches=n)
+    return dict(dtGd=quad_sum / max(n, 1),                            # 직접 분산형 (PSD 보장)
+                dtGd_vjp=(delta.to(Gd.device) * Gd).sum().item(),     # 일치성 점검
+                normGd2=(Gd * Gd).sum().item(), n_batches=n)
+
+
+def dir_emp_fisher_proxies(model, layer_name, delta, calib_loader, n_batches=4, device=DEVICE):
+    """방향성 경험적 Fisher  dtFd = E_i[(g_i·δ)²]  (per-sample 직접, batch-mean 근사 아님 — Codex).
+    g_i = ∂ℓ_i/∂W (true-label per-sample loss). 제곱이라 **항상 ⪰0**(STE breakdown서도) + Hessian/GGN과 *다름*
+    → A/B의 진짜 '다른 PSD proxy'. per-sample 방향그래디언트 [g_i·δ]를 per-sample-loss JVP(이중 backward) 한 패스로."""
+    crit = nn.CrossEntropyLoss(reduction='none')
+    W = dict(model.named_modules())[layer_name].weight
+    prev = W.requires_grad; W.requires_grad_(True)
+    model.eval()
+    delta = delta.to(device)
+    vals = []
+    try:
+        for i, (x, y) in enumerate(calib_loader):
+            if i >= n_batches:
+                break
+            x, y = x.to(device), y.to(device)
+            ell = crit(model(x), y)                                    # [B] per-sample loss
+            u = torch.zeros_like(ell, requires_grad=True)
+            vjp = torch.autograd.grad(ell, W, grad_outputs=u, create_graph=True)[0]   # Σ_i u_i g_i
+            gd  = torch.autograd.grad(vjp, u, grad_outputs=delta)[0]   # [B] = [g_i·δ]
+            vals.append((gd.detach() ** 2).mean().item())             # E_i[(g_i·δ)²]
+    finally:
+        W.requires_grad_(prev)
+    return float(np.mean(vals)) if vals else float('nan')
 
 
 def anchor_proxies(model, deltas, calib_loader, layers, n_batches=4, device=DEVICE):
@@ -727,8 +756,10 @@ def anchor_proxies(model, deltas, calib_loader, layers, n_batches=4, device=DEVI
         d = deltas[n]
         hv = hvp_proxies(model, n, d, calib_loader, n_batches, device)
         gg = ggn_proxies(model, n, d, calib_loader, n_batches, device)
+        ff = dir_emp_fisher_proxies(model, n, d, calib_loader, n_batches, device)
         out[n] = dict(dtHd=hv['dtHd'], normHd2=hv['normHd2'],
-                      dtGd=gg['dtGd'], normGd2=gg['normGd2'])
+                      dtGd=gg['dtGd'], dtGd_vjp=gg['dtGd_vjp'], normGd2=gg['normGd2'],
+                      dtFd=ff)
     return out
 
 
