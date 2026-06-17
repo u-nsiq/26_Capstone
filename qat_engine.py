@@ -827,3 +827,151 @@ def recover_subset(fp_model, n_bits, layers_to_train, train_loader, val_loader,
     return short_qat(qm, train_loader, val_loader, steps=steps, eval_at=eval_at,
                      lr=lr, momentum=0.0, seed=seed, track_loss=True,
                      return_state=return_state, device=device)
+
+
+# =====================================================================
+# 8. U4/U5 — subset 가산성·예산의존 (sprint v2 §3 · budget-dependence 검증)
+# =====================================================================
+def run_u4_additivity(fp_model, n_bits, layers, train_loader, val_loader,
+                      steps=300, eval_at=(30, 100, 300), seeds=(0, 1, 2),
+                      lr=1e-3, device=DEVICE):
+    """U4 가산성/redundancy gate: layers의 단일 R(i;t)·쌍 R({i,j};t) → seed-matched I_ij(t).
+    R = loss recovery = L_PTQ − L_S(t). multi-t는 한 run(eval_at 중간평가)서 *공짜* → train→steps 한 번.
+    I_ij(t) = R(ij;t) − R(i;t) − R(j;t)를 *seed별로* 계산 후 mean±std (seed-matched = 정직).
+    <0 subadditive(redundancy)→U5 greedy 필요 / ≈0 top-k OK / >0 synergy. (sprint v2 §3.1)
+    반환 dict(layers, t_evals, L_PTQ, R_single, R_pair, I, I_std, n_seeds). 쌍 키='a|b'(JSON 호환)."""
+    import itertools
+    eval_at = tuple(sorted(set(int(t) for t in eval_at)))
+    qm0 = make_ptq_model(fp_model, n_bits, device)              # 결정적 PTQ → L_PTQ 한 번
+    _, L_PTQ = evaluate_full(qm0, val_loader, device); del qm0
+
+    def R_of(subset):                                           # seed별 [{t: R}]
+        out = []
+        for s in seeds:
+            res = recover_subset(fp_model, n_bits, list(subset), train_loader, val_loader,
+                                 steps=steps, eval_at=eval_at, lr=lr, seed=s, device=device)
+            out.append({t: L_PTQ - res[t]['loss'] for t in eval_at})
+        return out
+
+    single_per = {n: R_of((n,)) for n in layers}
+    R_single = {n: {t: float(np.mean([p[t] for p in single_per[n]])) for t in eval_at} for n in layers}
+
+    R_pair, I, I_std = {}, {}, {}
+    for i, j in itertools.combinations(layers, 2):
+        key = f"{i}|{j}"; pair_per = R_of((i, j))
+        R_pair[key] = {t: float(np.mean([p[t] for p in pair_per])) for t in eval_at}
+        I_seed = [{t: pair_per[k][t] - single_per[i][k][t] - single_per[j][k][t] for t in eval_at}
+                  for k in range(len(seeds))]
+        I[key]     = {t: float(np.mean([v[t] for v in I_seed])) for t in eval_at}
+        I_std[key] = {t: float(np.std([v[t] for v in I_seed])) for t in eval_at}
+    return dict(layers=list(layers), t_evals=list(eval_at), L_PTQ=float(L_PTQ),
+                R_single=R_single, R_pair=R_pair, I=I, I_std=I_std, n_seeds=len(seeds))
+
+
+def layer_output_discrepancy(fp_model, n_bits, calib_loader, layers, n_batches=4, device=DEVICE):
+    """PTQAT-style output-discrepancy baseline: 층 l의 활성출력 *per-element MSE*  mean_{x,elem}(f_l(x;W) − f_l(x;Q(W)))².
+    full-PTQ 위 = upstream도 양자화된 *cumulative* discrepancy(PTQAT가 보는 양자화모델 기준 → 충실).
+    ⚠ numel로 나눠 *크기 편향 제거*(raw ‖·‖²는 큰 early층 편향, Codex). PTQAT는 이 값 *작은* 층 학습(반직관).
+    isolated_output_delta(최종 logit판)와 *다른 양*. (sprint v2 §3.2)"""
+    ptq_model = make_ptq_model(fp_model, n_bits, device)
+    fp_mods, pq_mods = dict(fp_model.named_modules()), dict(ptq_model.named_modules())
+    fp_o, pq_o, handles = {}, {}, []
+    for n in layers:
+        handles.append(fp_mods[n].register_forward_hook(lambda m, i, o, n=n: fp_o.__setitem__(n, o.detach())))
+        handles.append(pq_mods[n].register_forward_hook(lambda m, i, o, n=n: pq_o.__setitem__(n, o.detach())))
+    fp_model.eval(); ptq_model.eval()
+    sq = {n: 0.0 for n in layers}; ne = {n: 0 for n in layers}
+    try:
+        with torch.no_grad():
+            for bi, (x, y) in enumerate(calib_loader):
+                if bi >= n_batches:
+                    break
+                x = x.to(device); fp_model(x); ptq_model(x)
+                for n in layers:
+                    d = fp_o[n] - pq_o[n]
+                    sq[n] += d.pow(2).sum().item(); ne[n] += d.numel()
+    finally:
+        for h in handles:
+            h.remove()
+    return {n: sq[n] / ne[n] for n in layers}                # per-element MSE (크기 무관)
+
+
+def stage_diverse_subset(scores, costs, budget_ratio, by='normHd2', per_stage=2):
+    """U5 후보 A (redundancy-aware, *학습 전*): by 점수 내림차순이되 stage(이름 첫 토큰)당 per_stage개 제한.
+    같은 stage끼리 redundant(U4 가정) → stage 다양성으로 중복 회피. 완전 학습-전 = 순정 예측판. (§3.2 A)"""
+    budget = budget_ratio * sum(costs.values())
+    stage = lambda n: n.split('.')[0]
+    key = lambda n: (scores[n][by] if isinstance(scores[n], dict) else scores[n])
+    chosen, c, per = [], 0.0, {}
+    for n in sorted(scores, key=key, reverse=True):
+        st = stage(n)
+        if per.get(st, 0) >= per_stage or c + costs[n] > budget:
+            continue
+        chosen.append(n); c += costs[n]; per[st] = per.get(st, 0) + 1
+    return chosen
+
+
+def greedy_redundancy_subset(u4_res, costs, budget_ratio, t, all_costs_sum=None, fill=False):
+    """U5 후보 B (interaction-aware greedy, *exploratory*=측정값 사용): marginal = R(l) + Σ_{j∈S} I_lj.
+    **α 없음**(전부 loss-recovery 단위 → 임의가중 X). U4 측정 pool(top-N) 안에서만. t=U4 eval중 short.
+    fill=False(stop): gain≤0이면 중단 → 효율적이나 budget 덜 씀(param% 확인 필수).
+    fill=True: 부호 무시하고 예산 채울 때까지 → matched-cost 공정비교용. (Codex; §3.2 B)"""
+    layers = list(u4_res['layers'])
+    R = {n: u4_res['R_single'][n][t] for n in layers}
+
+    def I_of(a, b):
+        k = '%s|%s' % (a, b)
+        return u4_res['I'][k][t] if k in u4_res['I'] else u4_res['I']['%s|%s' % (b, a)][t]
+
+    budget = budget_ratio * (all_costs_sum or sum(costs.values()))
+    chosen, c, pool = [], 0.0, set(layers)
+    while pool:
+        best, best_gain = None, None
+        for l in pool:
+            if c + costs[l] > budget:
+                continue
+            gain = R[l] + sum(I_of(l, j) for j in chosen)
+            if best_gain is None or gain > best_gain:
+                best, best_gain = l, gain
+        if best is None or (not fill and best_gain <= 0):     # stop모드: 더 보탤 양(+) 없으면 중단
+            break
+        chosen.append(best); c += costs[best]; pool.discard(best)
+    return chosen
+
+
+def run_u5_subset(fp_model, n_bits, rule_subsets, train_loader, val_loader,
+                  steps=300, eval_at=(30, 100, 300), seeds=(0, 1, 2), lr=1e-3, device=DEVICE):
+    """U5: rule_subsets={rule:[layers]} 각각 recover_subset × seeds → R(rule;t) mean±std (R=L_PTQ−L(t)).
+    빈 리스트=PTQ-only(R=0), 전체=full(ceiling). param_ratio·wall-clock·peak VRAM 기록(효율성 보고용, Codex).
+    반환 dict(t_evals, L_PTQ, R, R_std, acc, param_ratio, wall, vram, n_seeds)."""
+    import time
+    eval_at = tuple(sorted(set(int(t) for t in eval_at)))
+    qm0 = make_ptq_model(fp_model, n_bits, device)
+    acc_ptq, L_PTQ = evaluate_full(qm0, val_loader, device); del qm0
+    all_cost = sum(get_layer_costs(fp_model).values())
+    cuda = torch.cuda.is_available()
+    R, R_std, ACC, pr, wall, vram = {}, {}, {}, {}, {}, {}
+    for rule, layers in rule_subsets.items():
+        if not layers:                                          # PTQ-only
+            R[rule] = {t: 0.0 for t in eval_at}; R_std[rule] = {t: 0.0 for t in eval_at}
+            ACC[rule] = {t: acc_ptq for t in eval_at}
+            pr[rule] = wall[rule] = vram[rule] = 0.0
+            continue
+        if cuda:
+            torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+        t0 = time.time(); pl, pa = [], []
+        for s in seeds:
+            res = recover_subset(fp_model, n_bits, list(layers), train_loader, val_loader,
+                                 steps=steps, eval_at=eval_at, lr=lr, seed=s, device=device)
+            pl.append({t: L_PTQ - res[t]['loss'] for t in eval_at})
+            pa.append({t: res[t]['acc'] for t in eval_at})
+        if cuda:
+            torch.cuda.synchronize()                            # 비동기 GPU 완료 대기 → 정확한 wall-clock (Codex)
+        wall[rule]  = (time.time() - t0) / len(seeds)           # per-seed 평균 wall-clock(s)
+        vram[rule]  = (torch.cuda.max_memory_allocated() / 1e9) if cuda else 0.0
+        R[rule]     = {t: float(np.mean([p[t] for p in pl])) for t in eval_at}
+        R_std[rule] = {t: float(np.std([p[t] for p in pl])) for t in eval_at}
+        ACC[rule]   = {t: float(np.mean([p[t] for p in pa])) for t in eval_at}
+        pr[rule]    = sum(get_layer_costs(fp_model, layers).values()) / all_cost
+    return dict(t_evals=list(eval_at), L_PTQ=float(L_PTQ), R=R, R_std=R_std,
+                acc=ACC, param_ratio=pr, wall=wall, vram=vram, n_seeds=len(seeds))
