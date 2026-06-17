@@ -985,7 +985,7 @@ def run_u5_subset(fp_model, n_bits, rule_subsets, train_loader, val_loader,
 # =====================================================================
 def run_generalization_cell(model_name, train_loader, val_loader, calib_loader, ckpt,
                             dataset='cifar100', n_bits=3, B=0.25, short_t=30, long_t=800,
-                            seeds=(0, 1, 2), lr=1e-3, device=DEVICE):
+                            seeds=(0, 1, 2), lr=1e-3, n_batches=8, device=DEVICE):
     """(model × W3)서 ①②진단 + ⑤payoff 재현. loader는 호출측서 줌(모델별 입력크기 대응).
     ① 단기proxy: normHd2 vs 단일층 short recovery *부분상관*(size 통제, partial_spearman).
     ① 역전: short-opt vs long-opt 층 + 1−ρ(short,long). *단일층을 long_t까지 돌려야 나옴(공짜 아님)* → 가벼우려면 long_t↓.
@@ -999,13 +999,13 @@ def run_generalization_cell(model_name, train_loader, val_loader, calib_loader, 
     ptq_acc, L_PTQ = evaluate_full(qm, val_loader, device)
     layers = list_quant_layers(qm)
     costs = get_layer_costs(qm, layers)
-    scores = proxy_scores(qm, fp_model, n_bits, calib_loader, layers=layers)
+    scores = proxy_scores(qm, fp_model, n_bits, calib_loader, layers=layers, n_batches=n_batches)  # 8배치=S1.2 참조(0.88)와 동일 추정예산 (PROTO-2)
 
     # ① 진단: 단일층 short(+long) recovery → normHd2 상관 + 역전
     single_R = {}
     for L in layers:
         per = [recover_subset(fp_model, n_bits, [L], train_loader, val_loader,
-                              steps=long_t, eval_at=eval_at, seed=s, device=device) for s in seeds]
+                              steps=long_t, eval_at=eval_at, lr=lr, seed=s, device=device) for s in seeds]
         single_R[L] = {t: float(np.mean([L_PTQ - p[t]['loss'] for p in per])) for t in eval_at}
     nh   = [scores[L]['normHd2'] for L in layers]
     rs_s = [single_R[L][short_t] for L in layers]
@@ -1016,13 +1016,19 @@ def run_generalization_cell(model_name, train_loader, val_loader, calib_loader, 
     short_opt  = max(layers, key=lambda L: single_R[L][short_t])
     long_opt   = max(layers, key=lambda L: single_R[L][long_t])
 
-    # ⑤ 적용: subset payoff (normHd2-topk vs random vs full)
+    # ⑤ 적용: subset payoff (normHd2-topk vs random×3 vs full) — random은 U5와 동일하게 ×3 평균(단일 draw 분산 회피, PROTO-1/HON-2)
     rng = np.random.default_rng(0)
     rules = {'PTQ-only': [], 'full': list(layers),
-             'normHd2-topk': select_subset(scores, costs, B, by='normHd2'),
-             'random':       select_subset({n: float(rng.random()) for n in layers}, costs, B)}
+             'normHd2-topk': select_subset(scores, costs, B, by='normHd2')}
+    for ri in range(3):
+        rules[f'random_{ri}'] = select_subset({n: float(rng.random()) for n in layers}, costs, B)
     payoff = run_u5_subset(fp_model, n_bits, rules, train_loader, val_loader,
-                           steps=long_t, eval_at=eval_at, seeds=seeds, device=device)
+                           steps=long_t, eval_at=eval_at, seeds=seeds, lr=lr, device=device)
+    _rk = [r for r in payoff['R'] if r.startswith('random_')]            # random(avg) 합성 (U5 add_rand_avg와 동일)
+    for _d in ('R', 'R_std', 'acc'):
+        payoff[_d]['random(avg)'] = {t: float(np.mean([payoff[_d][r][t] for r in _rk])) for t in payoff['t_evals']}
+    for _d in ('param_ratio', 'wall', 'vram'):
+        payoff[_d]['random(avg)'] = float(np.mean([payoff[_d][r] for r in _rk]))
     return dict(model=model_name, n_layers=len(layers), B=B, short_t=int(short_t), long_t=int(long_t),
                 fp_acc=float(fp_acc), ptq_acc=float(ptq_acc), gap=float(fp_acc - ptq_acc),
                 corr_short_partN=float(corr_short), inv_1mrho=float(inv_1mrho),
