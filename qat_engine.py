@@ -51,9 +51,11 @@ def load_model(name='resnet18', dataset='cifar100', ckpt=None, device=DEVICE):
     import timm
     num_classes = {'cifar100': 100, 'cifar10': 10}[dataset]
     model = timm.create_model(name, pretrained=False, num_classes=num_classes)
-    if dataset.startswith('cifar') and name == 'resnet18':
+    if dataset.startswith('cifar') and name in ('resnet18', 'resnet34'):   # 같은 7x7 stem+maxpool → 동일 수술 (G1 일반화)
         model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         model.maxpool = nn.Identity()
+    elif dataset.startswith('cifar') and name.startswith('mobilenet'):      # CIFAR 32x32: stem downsample 제거 (G1)
+        model.conv_stem.stride = (1, 1)
     if ckpt is not None:
         sd = torch.load(ckpt, map_location='cpu')
         sd = sd.get('state_dict', sd) if isinstance(sd, dict) else sd
@@ -976,3 +978,52 @@ def run_u5_subset(fp_model, n_bits, rule_subsets, train_loader, val_loader,
         pr[rule]    = sum(get_layer_costs(fp_model, layers).values()) / all_cost
     return dict(t_evals=list(eval_at), L_PTQ=float(L_PTQ), R=R, R_std=R_std,
                 acc=ACC, param_ratio=pr, wall=wall, vram=vram, n_seeds=len(seeds))
+
+
+# =====================================================================
+# 9. G1 — 모델 일반화 셀 (W3 고정 · 진단①② + 적용⑤ 재현 · model-agnostic)
+# =====================================================================
+def run_generalization_cell(model_name, train_loader, val_loader, calib_loader, ckpt,
+                            dataset='cifar100', n_bits=3, B=0.25, short_t=30, long_t=800,
+                            seeds=(0, 1, 2), lr=1e-3, device=DEVICE):
+    """(model × W3)서 ①②진단 + ⑤payoff 재현. loader는 호출측서 줌(모델별 입력크기 대응).
+    ① 단기proxy: normHd2 vs 단일층 short recovery *부분상관*(size 통제, partial_spearman).
+    ① 역전: short-opt vs long-opt 층 + 1−ρ(short,long). *단일층을 long_t까지 돌려야 나옴(공짜 아님)* → 가벼우려면 long_t↓.
+    ⑤ payoff: normHd2-topk / random / full 부분QAT acc·recovery%.
+    FP 캐시 없으면 train_baseline가 학습(모델별 long pole). (G1)"""
+    eval_at = tuple(sorted({int(short_t), int(long_t)}))
+    fp_model = load_model(model_name, dataset, device=device)
+    fp_model, fp_acc = train_baseline(fp_model, train_loader, val_loader, ckpt_path=ckpt, resume=True)
+    fp_model.eval()
+    qm = make_ptq_model(fp_model, n_bits, device)
+    ptq_acc, L_PTQ = evaluate_full(qm, val_loader, device)
+    layers = list_quant_layers(qm)
+    costs = get_layer_costs(qm, layers)
+    scores = proxy_scores(qm, fp_model, n_bits, calib_loader, layers=layers)
+
+    # ① 진단: 단일층 short(+long) recovery → normHd2 상관 + 역전
+    single_R = {}
+    for L in layers:
+        per = [recover_subset(fp_model, n_bits, [L], train_loader, val_loader,
+                              steps=long_t, eval_at=eval_at, seed=s, device=device) for s in seeds]
+        single_R[L] = {t: float(np.mean([L_PTQ - p[t]['loss'] for p in per])) for t in eval_at}
+    nh   = [scores[L]['normHd2'] for L in layers]
+    rs_s = [single_R[L][short_t] for L in layers]
+    rs_l = [single_R[L][long_t] for L in layers]
+    Nvec = [costs[L] for L in layers]
+    corr_short = partial_spearman(nh, rs_s, Nvec)          # size 통제 후 normHd2→short
+    inv_1mrho  = 1.0 - spearman(rs_s, rs_l)                # short↔long 순위 역전 강도
+    short_opt  = max(layers, key=lambda L: single_R[L][short_t])
+    long_opt   = max(layers, key=lambda L: single_R[L][long_t])
+
+    # ⑤ 적용: subset payoff (normHd2-topk vs random vs full)
+    rng = np.random.default_rng(0)
+    rules = {'PTQ-only': [], 'full': list(layers),
+             'normHd2-topk': select_subset(scores, costs, B, by='normHd2'),
+             'random':       select_subset({n: float(rng.random()) for n in layers}, costs, B)}
+    payoff = run_u5_subset(fp_model, n_bits, rules, train_loader, val_loader,
+                           steps=long_t, eval_at=eval_at, seeds=seeds, device=device)
+    return dict(model=model_name, n_layers=len(layers), B=B, short_t=int(short_t), long_t=int(long_t),
+                fp_acc=float(fp_acc), ptq_acc=float(ptq_acc), gap=float(fp_acc - ptq_acc),
+                corr_short_partN=float(corr_short), inv_1mrho=float(inv_1mrho),
+                short_opt=short_opt, long_opt=long_opt, single_R=single_R, payoff=payoff)
