@@ -947,8 +947,9 @@ def run_u5_subset(fp_model, n_bits, rule_subsets, train_loader, val_loader,
     import time
     eval_at = tuple(sorted(set(int(t) for t in eval_at)))
     qm0 = make_ptq_model(fp_model, n_bits, device)
-    acc_ptq, L_PTQ = evaluate_full(qm0, val_loader, device); del qm0
-    all_cost = sum(get_layer_costs(fp_model).values())
+    acc_ptq, L_PTQ = evaluate_full(qm0, val_loader, device)
+    all_cost = sum(get_layer_costs(qm0, list_quant_layers(qm0)).values())  # qm0=양자화모델(fp_model엔 quant층 없음!)
+    del qm0
     cuda = torch.cuda.is_available()
     R, R_std, ACC, pr, wall, vram = {}, {}, {}, {}, {}, {}
     for rule, layers in rule_subsets.items():
